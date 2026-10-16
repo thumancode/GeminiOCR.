@@ -36,6 +36,9 @@ on:
       rpd_limit:
         description: "দৈনিক সর্বোচ্চ রিকুয়েস্ট (সীমা 500, নিরাপদ মান 480)"
         default: "480"
+      start_page:
+        description: "কত নম্বর পেইজ থেকে শুরু হবে (ফাইলের নামের সংখ্যা ধরে, যেমন 0008.jpg = 8; 1 = শুরু থেকে)"
+        default: "1"
       max_images:
         description: "এই রানে সর্বোচ্চ কয়টি ইমেজ (0 = সব)"
         default: "0"
@@ -61,6 +64,7 @@ jobs:
       MODEL: ${{ inputs.model || 'gemini-3.5-flash-lite' }}
       RPM: ${{ inputs.rpm || '5' }}
       RPD_LIMIT: ${{ inputs.rpd_limit || '480' }}
+      START_PAGE: ${{ inputs.start_page || '1' }}
       MAX_IMAGES: ${{ inputs.max_images || '0' }}
       PROGRESS_FILE: ocr_progress.json
       GH_TOKEN: ${{ github.token }}
@@ -96,6 +100,7 @@ jobs:
           PROMPT_FILE   = os.environ["PROMPT_FILE"]
           MODEL         = os.environ["MODEL"]
           MAX_IMAGES    = int(os.environ.get("MAX_IMAGES", "0") or 0)
+          START_PAGE    = max(1, int(os.environ.get("START_PAGE", "1") or 1))
           PROGRESS_FILE = os.environ["PROGRESS_FILE"]
 
           RPM           = max(1, min(15, int(os.environ.get("RPM", "5") or 5)))
@@ -358,8 +363,19 @@ jobs:
 
           # ---------- মূল লুপ ----------
           done_set = set(completed)
-          pending = [i for i in images if i not in done_set]
-          log(f"মোট: {total} | সম্পূর্ণ: {len(done_set)} | বাকি: {len(pending)}")
+
+          # পেইজ নম্বর = ফাইলের নামের শেষ সংখ্যা (0008.jpg → 8); সংখ্যা না থাকলে তালিকার ক্রম (১ থেকে)
+          def page_no(name, pos):
+              nums = re.findall(r"\d+", os.path.splitext(name)[0])
+              return int(nums[-1]) if nums else pos + 1
+
+          page_nums = {n: page_no(n, p) for p, n in enumerate(images)}
+          before_start = [i for i in images if page_nums[i] < START_PAGE]
+          pending = [i for i in images if i not in done_set and page_nums[i] >= START_PAGE]
+          log(f"মোট: {total} | সম্পূর্ণ: {len(done_set)} | শুরুর পেইজ: {START_PAGE} "
+              f"(এর আগের {len(before_start)}টি বাদ) | বাকি: {len(pending)}")
+          if not pending:
+              log(f"শুরুর পেইজ {START_PAGE} থেকে প্রসেস করার মতো কোনো ইমেজ বাকি নেই।")
           log(f"লিমিট সেটিং: RPM={RPM}, গ্যাপ≥{MIN_GAP:.0f}s, RPD={RPD_LIMIT} (আজ আগে ব্যবহার: {usage['requests']}), TPM<{TPM_SAFE}")
 
           processed = 0
@@ -423,7 +439,7 @@ jobs:
 
           # ---------- শেষ ----------
           done_set = set(completed)
-          remaining = [i for i in images if i not in done_set]
+          remaining = [i for i in images if i not in done_set and page_nums[i] >= START_PAGE]
           retriable = [i for i in remaining if i not in failed]
           log(f"\nএই রানে প্রসেস: {processed} | মোট সম্পূর্ণ: {len(done_set)}/{total} | ব্যর্থ: {len(failed)} | আজকের রিকুয়েস্ট: {usage['requests']}/{RPD_LIMIT}")
 
@@ -438,4 +454,14 @@ jobs:
 
       - name: Re-trigger if work remains
         if: steps.ocr.outputs.remaining == 'true'
-        run: gh workflow run "${{ github.workflow }}" --ref "${{ github.ref_name }}"
+        # নিজেকে আবার চালু করার সময় একই ইনপুটগুলো পাঠায় (না হলে ডিফল্ট মানে চলে যেত)
+        run: |
+          gh workflow run "${{ github.workflow }}" --ref "${{ github.ref_name }}" \
+            -f pages_dir="${PAGES_DIR}" \
+            -f output_dir="${OUTPUT_DIR}" \
+            -f prompt_file="${PROMPT_FILE}" \
+            -f model="${MODEL}" \
+            -f rpm="${RPM}" \
+            -f rpd_limit="${RPD_LIMIT}" \
+            -f start_page="${START_PAGE}" \
+            -f max_images="${MAX_IMAGES}"
