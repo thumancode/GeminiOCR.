@@ -1,19 +1,20 @@
 {
   "model": "qwen/qwen3.8-27b",
   "total_images": 20,
-  "completed_count": 4,
-  "last_completed": "0004.jpg",
-  "next_pending": "0005.jpg",
+  "completed_count": 5,
+  "last_completed": "0005.jpg",
+  "next_pending": "0006.jpg",
   "usage": {
     "date": "2026-10-17",
-    "requests": 13,
-    "tokens": 59715
+    "requests": 18,
+    "tokens": 77927
   },
   "completed": [
     "0001.jpg",
     "0002.jpg",
     "0003.jpg",
-    "0004.jpg"
+    "0004.jpg",
+    "0005.jpg"
   ],
   "failed": {},
   "warnings": {
@@ -27,7 +28,10 @@
     ],
     "0004.jpg": [
       "দেবনাগরী অক্ষর: ।"
+    ],
+    "0005.jpg": [
+      "দেবনাগরী অক্ষর: ।"
     ]
   },
-  "updated_at": "2026-10-17T13:59:47.170366+00:00"
+  "updated_at": "2026-10-17T14:04:36.484734+00:00"
 }
