@@ -275,7 +275,8 @@ jobs:
           # ---------- আউটপুট যাচাই (ভিন্ন লিপির অক্ষর / markdown ধরা) ----------
           RE_BN = re.compile(r"[\u0980-\u09FF]")
           RE_AR = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
-          RE_DV = re.compile(r"[\u0900-\u097F]")
+          # U+0964 (।) ও U+0965 (॥) বাংলাতেও দাঁড়ি হিসেবে ব্যবহৃত হয়, তাই এ দুটি বাদ
+          RE_DV = re.compile(r"[\u0900-\u0963\u0966-\u097F]")
           RE_MD = re.compile(r"\*\*|^\s{0,3}#{1,6}\s|^\s*[-*]\s", re.M)
 
           def validate(text):
