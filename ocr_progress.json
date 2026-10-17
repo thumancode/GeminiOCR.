@@ -6,12 +6,17 @@
   "next_pending": "0002.jpg",
   "usage": {
     "date": "2026-10-17",
-    "requests": 1
+    "requests": 7
   },
   "completed": [
     "0001.jpg"
   ],
-  "failed": {},
+  "failed": {
+    "0002.jpg": {
+      "error": "HTTP 503: {\n  \"error\": {\n    \"code\": 503,\n    \"message\": \"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\n    \"status\": \"UNAVAILABLE\"\n  }\n}\n",
+      "at": "2026-10-17T09:06:01.848070+00:00"
+    }
+  },
   "warnings": {},
-  "updated_at": "2026-10-17T08:59:12.068257+00:00"
+  "updated_at": "2026-10-17T09:06:01.848117+00:00"
 }
