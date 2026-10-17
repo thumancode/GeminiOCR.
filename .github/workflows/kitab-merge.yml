@@ -1,0 +1,198 @@
+name: Kitab Merge Texts
+
+# texts/ ফোল্ডারের সব .txt ফাইল সিরিয়াল (0001, 0002, 0003 ...) অনুযায়ী জুড়ে
+# একটি ফাইল বানায় → final_texts/ ফোল্ডারে commit + push করে।
+# প্রতিটি ফাইলের ভেতরের লাইন ব্রেক হুবহু বজায় থাকে।
+#
+# Settings → Actions → General → Workflow permissions → "Read and write permissions" চালু থাকতে হবে।
+
+on:
+  workflow_dispatch:
+    inputs:
+      texts_dir:
+        description: "ইনপুট টেক্সট ফোল্ডার"
+        default: "texts"
+      output_dir:
+        description: "আউটপুট ফোল্ডার"
+        default: "final_texts"
+      output_name:
+        description: "আউটপুট ফাইলের নাম (.txt না দিলে নিজে যোগ হবে)"
+        default: "book.txt"
+      separator:
+        description: "দুই পেইজের মাঝে কী থাকবে"
+        type: choice
+        options:
+          - blank_line     # মাঝে একটি ফাঁকা লাইন
+          - newline        # শুধু নতুন লাইন (ফাঁকা লাইন ছাড়া)
+          - page_marker    # --- পেইজ 0008 --- চিহ্ন
+        default: blank_line
+      start_page:
+        description: "কত নম্বর পেইজ থেকে (1 = শুরু থেকে)"
+        default: "1"
+      end_page:
+        description: "কত নম্বর পেইজ পর্যন্ত (0 = শেষ পর্যন্ত)"
+        default: "0"
+      proofed_only:
+        description: "শুধু প্রুফড (proofed.json এ থাকা) পেইজ জুড়বে?"
+        type: boolean
+        default: false
+      proofed_file:
+        description: "প্রুফড তালিকার ফাইল"
+        default: "proofed.json"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kitab-merge
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    env:
+      TEXTS_DIR: ${{ inputs.texts_dir || 'texts' }}
+      OUTPUT_DIR: ${{ inputs.output_dir || 'final_texts' }}
+      OUTPUT_NAME: ${{ inputs.output_name || 'book.txt' }}
+      SEPARATOR: ${{ inputs.separator || 'blank_line' }}
+      START_PAGE: ${{ inputs.start_page || '1' }}
+      END_PAGE: ${{ inputs.end_page || '0' }}
+      PROOFED_ONLY: ${{ inputs.proofed_only }}
+      PROOFED_FILE: ${{ inputs.proofed_file || 'proofed.json' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Merge text files in serial order
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, json
+          from pathlib import Path
+
+          TEXTS_DIR   = Path(os.environ["TEXTS_DIR"])
+          OUTPUT_DIR  = Path(os.environ["OUTPUT_DIR"])
+          OUTPUT_NAME = os.environ["OUTPUT_NAME"].strip() or "book.txt"
+          SEPARATOR   = os.environ["SEPARATOR"].strip() or "blank_line"
+          START_PAGE  = max(1, int(os.environ.get("START_PAGE", "1") or 1))
+          END_PAGE    = int(os.environ.get("END_PAGE", "0") or 0)
+          PROOFED_ONLY = os.environ.get("PROOFED_ONLY", "false").strip().lower() == "true"
+          PROOFED_FILE = Path(os.environ["PROOFED_FILE"])
+
+          if not OUTPUT_NAME.lower().endswith(".txt"):
+              OUTPUT_NAME += ".txt"
+          OUTPUT_NAME = Path(OUTPUT_NAME).name   # শুধু ফাইলের নাম, পাথ নয়
+
+          if not TEXTS_DIR.is_dir():
+              print(f"::error::{TEXTS_DIR}/ ফোল্ডার পাওয়া যায়নি।")
+              sys.exit(1)
+
+          def page_no(stem):
+              nums = re.findall(r"\d+", stem)
+              return int(nums[-1]) if nums else None
+
+          def natural_key(s):
+              return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+          files = [f for f in TEXTS_DIR.iterdir() if f.is_file() and f.suffix.lower() == ".txt"]
+          if not files:
+              print(f"::error::{TEXTS_DIR}/ এ কোনো .txt ফাইল নেই।")
+              sys.exit(1)
+
+          # সিরিয়াল: পেইজ নম্বর ধরে, সংখ্যা না থাকলে নামের প্রাকৃতিক ক্রম
+          files.sort(key=lambda f: (page_no(f.stem) if page_no(f.stem) is not None else 10**9, natural_key(f.name)))
+
+          # প্রুফড ফিল্টার
+          proofed = None
+          if PROOFED_ONLY:
+              if not PROOFED_FILE.is_file():
+                  print(f"::error::{PROOFED_FILE} পাওয়া যায়নি (প্রুফড-অনলি চালু আছে)।")
+                  sys.exit(1)
+              data = json.loads(PROOFED_FILE.read_text(encoding="utf-8"))
+              proofed = set(data.get("proofed", []))
+              print(f"প্রুফড তালিকায় {len(proofed)} টি পেইজ আছে।")
+
+          selected = []
+          for f in files:
+              n = page_no(f.stem)
+              if n is not None:
+                  if n < START_PAGE:
+                      continue
+                  if END_PAGE and n > END_PAGE:
+                      continue
+              if proofed is not None and f.stem not in proofed:
+                  continue
+              selected.append(f)
+
+          if not selected:
+              print("::error::জোড়ার মতো কোনো ফাইল পাওয়া যায়নি (পেইজ রেঞ্জ/ফিল্টার দেখুন)।")
+              sys.exit(1)
+
+          # ফাঁক (missing পেইজ) যাচাই
+          nums = [page_no(f.stem) for f in selected if page_no(f.stem) is not None]
+          if nums:
+              present = set(nums)
+              missing = [n for n in range(min(nums), max(nums) + 1) if n not in present]
+              if missing:
+                  show = ", ".join(str(m) for m in missing[:50]) + (" ..." if len(missing) > 50 else "")
+                  print(f"::warning::{len(missing)} টি পেইজের txt নেই (ক্রমে ফাঁক): {show}")
+
+          parts, empty = [], []
+          for f in selected:
+              raw = f.read_bytes().decode("utf-8-sig", errors="replace")
+              text = raw.replace("\r\n", "\n").replace("\r", "\n")
+              # ভেতরের লাইন ব্রেক অক্ষত; শুধু ফাইলের শেষের বাড়তি ফাঁকা লাইন ছাঁটা হয়
+              text = text.rstrip("\n")
+              if not text.strip():
+                  empty.append(f.name)
+              if SEPARATOR == "page_marker":
+                  text = f"--- পেইজ {f.stem} ---\n{text}"
+              parts.append(text)
+
+          joiner = "\n" if SEPARATOR == "newline" else "\n\n"
+          merged = joiner.join(parts) + "\n"
+
+          OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+          out = OUTPUT_DIR / OUTPUT_NAME
+          out.write_text(merged, encoding="utf-8", newline="\n")
+
+          if empty:
+              print(f"::warning::{len(empty)} টি ফাইল খালি: {', '.join(empty[:30])}")
+          print(f"✔ {len(selected)} টি ফাইল জোড়া হয়েছে → {out}")
+          print(f"  প্রথম: {selected[0].name} | শেষ: {selected[-1].name}")
+          print(f"  মোট অক্ষর: {len(merged)} | মোট লাইন: {merged.count(chr(10))}")
+          PY
+
+      - name: Commit and push
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A -- "$OUTPUT_DIR"
+          if git diff --cached --quiet; then
+            echo "কোনো পরিবর্তন নেই (আগের ফাইলের মতোই), push করার কিছু নেই।"
+            exit 0
+          fi
+          git commit -q -m "Merge texts into $OUTPUT_DIR/$OUTPUT_NAME"
+          pushed=0
+          for i in 1 2 3 4 5; do
+            git pull --rebase --autostash -q || true
+            if git push -q; then
+              pushed=1
+              break
+            fi
+            echo "push ব্যর্থ ($i/5), আবার চেষ্টা..."
+            sleep $((i*5))
+          done
+          if [ "$pushed" -ne 1 ]; then
+            echo "::error::push করা যায়নি"
+            exit 1
+          fi
+          echo "✔ push হয়েছে: $OUTPUT_DIR/"
