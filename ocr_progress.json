@@ -2,12 +2,12 @@
   "provider": "torveai",
   "model": "claude-fable-5",
   "total_images": 52,
-  "completed_count": 12,
-  "last_completed": "0012.jpg",
-  "next_pending": "0013.jpg",
+  "completed_count": 13,
+  "last_completed": "0013.jpg",
+  "next_pending": "0014.jpg",
   "usage": {
     "date": "2026-10-17",
-    "requests": 15
+    "requests": 19
   },
   "completed": [
     "0001.jpg",
@@ -21,13 +21,18 @@
     "0009.jpg",
     "0010.jpg",
     "0011.jpg",
-    "0012.jpg"
+    "0012.jpg",
+    "0013.jpg"
   ],
   "failed": {},
   "warnings": {
     "0012.jpg": [
       "বাংলা-আরবি মিশ্র শব্দ: دين)-এর"
+    ],
+    "0013.jpg": [
+      "বাংলা-আরবি মিশ্র শব্দ: وَسَلَّمَ-এর",
+      "বাংলা-আরবি মিশ্র শব্দ: وَسَلَّمَ)-এর"
     ]
   },
-  "updated_at": "2026-10-17T19:51:07.530652+00:00"
+  "updated_at": "2026-10-17T19:55:29.031528+00:00"
 }
