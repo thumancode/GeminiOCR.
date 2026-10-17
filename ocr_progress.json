@@ -1,15 +1,16 @@
 {
   "model": "gemini-3.5-flash",
   "total_images": 37,
-  "completed_count": 1,
-  "last_completed": "0001.jpg",
+  "completed_count": 2,
+  "last_completed": "0003.jpg",
   "next_pending": "0002.jpg",
   "usage": {
     "date": "2026-10-17",
-    "requests": 7
+    "requests": 12
   },
   "completed": [
-    "0001.jpg"
+    "0001.jpg",
+    "0003.jpg"
   ],
   "failed": {
     "0002.jpg": {
@@ -17,6 +18,10 @@
       "at": "2026-10-17T09:06:01.848070+00:00"
     }
   },
-  "warnings": {},
-  "updated_at": "2026-10-17T09:06:01.848117+00:00"
+  "warnings": {
+    "0003.jpg": [
+      "দেবনাগরী অক্ষর: ।"
+    ]
+  },
+  "updated_at": "2026-10-17T09:09:35.015428+00:00"
 }
