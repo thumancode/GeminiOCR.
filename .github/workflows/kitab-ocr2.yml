@@ -1,0 +1,503 @@
+name: Kitab OCR (Gemini)
+
+# ব্যবহার: এই ফাইলটি রাখুন  .github/workflows/kitab-ocr.yml
+# Secret: Settings → Secrets and variables → Actions → New repository secret → নাম: GEMINI_API_KEY
+# Settings → Actions → General → Workflow permissions → Read and write permissions
+#
+# রিপোর গঠন:
+#   prompt.txt          (মেইন রিপোতে, প্রম্পট)
+#   pages/              (কিতাবের ইমেজ: 0001.jpg, 0002.jpg ...)
+#   texts/              (আউটপুট txt এখানে তৈরি হবে)
+#   ocr_progress.json   (অগ্রগতি + দৈনিক রিকুয়েস্ট কাউন্ট)
+#
+# লিমিট সুরক্ষা (মডেল ভেদে কোটা আলাদা — AI Studio তে নিজের কোটা দেখে rpm / rpd_limit ঠিক করুন; নিচের হিসাব 15 RPM / 250K TPM / 500 RPD ধরে):
+#   - RPM : ডিফল্ট ৫ (যেকোনো ৬২ সেকেন্ডে সর্বোচ্চ ৫টি HTTP কল, রিট্রাই সহ) + প্রতি কলের মাঝে ন্যূনতম ১২ সেকেন্ড গ্যাপ
+#   - TPM : ব্যবহৃত টোকেন ট্র্যাক করে, ২,০০,০০০ এর নিচে রাখে
+#   - RPD : ডিফল্ট ৪৮০ এ থামে (Pacific সময়ের তারিখ অনুযায়ী কাউন্ট), 429 "PerDay" পেলেও সাথে সাথে থামে
+
+on:
+  workflow_dispatch:
+    inputs:
+      pages_dir:
+        description: "ইমেজ ফোল্ডার"
+        default: "pages"
+      output_dir:
+        description: "টেক্সট আউটপুট ফোল্ডার"
+        default: "texts"
+      prompt_file:
+        description: "প্রম্পট ফাইল"
+        default: "prompt.txt"
+      model:
+        description: "Gemini মডেল"
+        default: "gemini-3.5-flash"
+      rpm:
+        description: "প্রতি মিনিটে সর্বোচ্চ রিকুয়েস্ট (সর্বোচ্চ 15)"
+        default: "5"
+      rpd_limit:
+        description: "দৈনিক সর্বোচ্চ রিকুয়েস্ট (সীমা 500, নিরাপদ মান 480)"
+        default: "480"
+      start_page:
+        description: "কত নম্বর পেইজ থেকে শুরু হবে (ফাইলের নামের সংখ্যা ধরে, যেমন 0008.jpg = 8; 1 = শুরু থেকে)"
+        default: "1"
+      max_images:
+        description: "এই রানে সর্বোচ্চ কয়টি ইমেজ (0 = সব)"
+        default: "0"
+
+permissions:
+  contents: write   # টেক্সট ও json পুশ করার জন্য
+  actions: write    # সময় শেষ হলে নিজেকে আবার চালু করার জন্য
+
+# একসাথে দুইটা রান যেন না চলে (না হলে লিমিট দ্বিগুণ খরচ হবে)
+concurrency:
+  group: kitab-ocr
+  cancel-in-progress: false
+
+jobs:
+  ocr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      PAGES_DIR: ${{ inputs.pages_dir || 'pages' }}
+      OUTPUT_DIR: ${{ inputs.output_dir || 'texts' }}
+      PROMPT_FILE: ${{ inputs.prompt_file || 'prompt.txt' }}
+      MODEL: ${{ inputs.model || 'gemini-3.5-flash' }}
+      RPM: ${{ inputs.rpm || '5' }}
+      RPD_LIMIT: ${{ inputs.rpd_limit || '480' }}
+      START_PAGE: ${{ inputs.start_page || '1' }}
+      MAX_IMAGES: ${{ inputs.max_images || '0' }}
+      PROGRESS_FILE: ocr_progress.json
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run OCR (one image at a time, push after each)
+        id: ocr
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, json, time, base64, subprocess
+          from collections import deque
+          from datetime import datetime, timezone, timedelta
+          from zoneinfo import ZoneInfo
+          import requests
+
+          # ---------- কনফিগ ----------
+          API_KEY       = os.environ.get("GEMINI_API_KEY", "").strip()
+          PAGES_DIR     = os.environ["PAGES_DIR"]
+          OUTPUT_DIR    = os.environ["OUTPUT_DIR"]
+          PROMPT_FILE   = os.environ["PROMPT_FILE"]
+          MODEL         = os.environ["MODEL"]
+          MAX_IMAGES    = int(os.environ.get("MAX_IMAGES", "0") or 0)
+          START_PAGE    = max(1, int(os.environ.get("START_PAGE", "1") or 1))
+          PROGRESS_FILE = os.environ["PROGRESS_FILE"]
+
+          RPM           = max(1, min(15, int(os.environ.get("RPM", "5") or 5)))
+          RPD_LIMIT     = max(1, min(500, int(os.environ.get("RPD_LIMIT", "480") or 480)))
+          TPM_SAFE      = 200_000          # ২৫০K সীমার নিচে নিরাপদ মান
+          WINDOW        = 62.0             # ৬০ সেকেন্ডের বদলে ২ সেকেন্ড বেশি, নিরাপত্তার জন্য
+          MIN_GAP       = 60.0 / RPM       # দুই কলের মাঝে ন্যূনতম বিরতি (RPM=5 → 12s)
+
+          MAX_RETRIES   = 6
+          VAL_RETRIES   = 3                # ভিন্ন লিপির অক্ষর ধরা পড়লে সর্বোচ্চ কতবার আবার চেষ্টা
+          TIME_BUDGET   = 5 * 3600 + 35 * 60
+          START         = time.time()
+          PT            = ZoneInfo("America/Los_Angeles")
+          BD            = ZoneInfo("Asia/Dhaka")
+          EXTS          = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                           ".png": "image/png", ".webp": "image/webp"}
+
+          GEMINI_URL = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+                        f"{MODEL}:streamGenerateContent?alt=sse&key={API_KEY}")
+
+          class DailyLimit(Exception):
+              pass
+
+          class FatalError(Exception):
+              """API key / অনুমতির সমস্যা — retry করে লাভ নেই, পুরো রান থামাতে হবে।"""
+              pass
+
+          def log(*a):
+              print(*a, flush=True)
+
+          def set_output(k, v):
+              path = os.environ.get("GITHUB_OUTPUT")
+              if path:
+                  with open(path, "a") as f:
+                      f.write(f"{k}={v}\n")
+
+          def sh(*cmd, check=True):
+              return subprocess.run(cmd, check=check, capture_output=True, text=True)
+
+          def natural_key(s):
+              return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+          def pt_date():
+              return datetime.now(PT).strftime("%Y-%m-%d")
+
+          def reset_time_bd():
+              n = datetime.now(PT)
+              nxt = (n + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+              return nxt.astimezone(BD).strftime("%Y-%m-%d %I:%M %p (বাংলাদেশ সময়)")
+
+          # ---------- প্রি-চেক ----------
+          if not API_KEY:
+              log("::error::GEMINI_API_KEY secret সেট করা নেই।")
+              sys.exit(1)
+          if not os.path.isfile(PROMPT_FILE):
+              log(f"::error::{PROMPT_FILE} পাওয়া যায়নি।")
+              sys.exit(1)
+          if not os.path.isdir(PAGES_DIR):
+              log(f"::error::{PAGES_DIR}/ ফোল্ডার পাওয়া যায়নি।")
+              sys.exit(1)
+
+          with open(PROMPT_FILE, encoding="utf-8") as f:
+              PROMPT = f.read().strip()
+          if not PROMPT:
+              log("::error::prompt.txt খালি।")
+              sys.exit(1)
+
+          os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+          images = sorted(
+              [f for f in os.listdir(PAGES_DIR)
+               if os.path.splitext(f)[1].lower() in EXTS],
+              key=natural_key)
+          total = len(images)
+          if total == 0:
+              log("কোনো ইমেজ পাওয়া যায়নি।")
+              set_output("remaining", "false")
+              sys.exit(0)
+
+          # ---------- প্রগ্রেস লোড ----------
+          def load_progress():
+              if os.path.isfile(PROGRESS_FILE):
+                  try:
+                      with open(PROGRESS_FILE, encoding="utf-8") as f:
+                          return json.load(f)
+                  except Exception:
+                      pass
+              return {}
+
+          progress = load_progress()
+          completed = list(progress.get("completed", []))
+          failed = dict(progress.get("failed", {}))
+          warnings = dict(progress.get("warnings", {}))
+          last_completed = progress.get("last_completed")
+          usage = progress.get("usage", {})
+          if usage.get("date") != pt_date():
+              usage = {"date": pt_date(), "requests": 0}
+
+          def save_progress(last=None):
+              global last_completed
+              if last:
+                  last_completed = last
+              done_set = set(completed)
+              obj = {
+                  "model": MODEL,
+                  "total_images": total,
+                  "completed_count": len(completed),
+                  "last_completed": last_completed,
+                  "next_pending": next((i for i in images if i not in done_set), None),
+                  "usage": usage,
+                  "completed": completed,
+                  "failed": failed,
+                  "warnings": warnings,
+                  "updated_at": datetime.now(timezone.utc).isoformat(),
+              }
+              with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+                  json.dump(obj, f, ensure_ascii=False, indent=2)
+
+          # ---------- রেট-লিমিট নিয়ন্ত্রণ ----------
+          req_times = deque()      # প্রতিটি HTTP কলের সময় (রিট্রাই সহ)
+          tok_events = deque()     # (সময়, টোকেন)
+          state = {"last_req": 0.0, "last_tokens": 8000}
+
+          def throttle():
+              """কল করার আগে RPM / TPM / RPD তিনটাই নিশ্চিত করে।"""
+              # দিন বদলালে (Pacific) দৈনিক কাউন্ট রিসেট
+              global usage
+              if usage.get("date") != pt_date():
+                  usage = {"date": pt_date(), "requests": 0}
+              if usage["requests"] >= RPD_LIMIT:
+                  raise DailyLimit(f"দৈনিক সীমা ({RPD_LIMIT}) পূর্ণ")
+              while True:
+                  now = time.time()
+                  while req_times and now - req_times[0] >= WINDOW:
+                      req_times.popleft()
+                  while tok_events and now - tok_events[0][0] >= WINDOW:
+                      tok_events.popleft()
+                  wait = 0.0
+                  # ন্যূনতম গ্যাপ
+                  wait = max(wait, MIN_GAP - (now - state["last_req"]))
+                  # স্লাইডিং উইন্ডো RPM
+                  if len(req_times) >= RPM:
+                      wait = max(wait, WINDOW - (now - req_times[0]))
+                  # TPM
+                  used = sum(t for _, t in tok_events)
+                  if tok_events and used + state["last_tokens"] > TPM_SAFE:
+                      wait = max(wait, WINDOW - (now - tok_events[0][0]))
+                  if wait <= 0:
+                      break
+                  log(f"   ⏳ লিমিট সুরক্ষা: {wait:.0f}s অপেক্ষা (RPM={len(req_times)}/{RPM}, TPM≈{used})")
+                  time.sleep(wait + 0.3)
+              t = time.time()
+              req_times.append(t)
+              state["last_req"] = t
+              usage["requests"] += 1
+
+          def parse_retry_delay(body):
+              m = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', body)
+              return float(m.group(1)) if m else None
+
+          # ---------- আউটপুট যাচাই (ভিন্ন লিপির অক্ষর / markdown ধরা) ----------
+          RE_BN = re.compile(r"[\u0980-\u09FF]")
+          RE_AR = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
+          RE_DV = re.compile(r"[\u0900-\u097F]")
+          RE_MD = re.compile(r"\*\*|^\s{0,3}#{1,6}\s|^\s*[-*]\s", re.M)
+
+          def validate(text):
+              probs = []
+              dv = RE_DV.findall(text)
+              if dv:
+                  probs.append("দেবনাগরী অক্ষর: " + "".join(sorted(set(dv)))[:20])
+              for tok in text.split():
+                  if RE_BN.search(tok) and RE_AR.search(tok):
+                      probs.append("বাংলা-আরবি মিশ্র শব্দ: " + tok)
+              if RE_MD.search(text):
+                  probs.append("markdown চিহ্ন")
+              return probs[:6]
+
+
+          # ---------- Gemini কল (streaming SSE) ----------
+          def ocr_image(path):
+              mime = EXTS[os.path.splitext(path)[1].lower()]
+              with open(path, "rb") as f:
+                  b64 = base64.b64encode(f.read()).decode()
+              body = {
+                  "contents": [{
+                      "role": "user",
+                      "parts": [
+                          {"text": PROMPT},
+                          {"inline_data": {"mime_type": mime, "data": b64}},
+                      ],
+                  }],
+                  "generationConfig": {"temperature": 0},
+              }
+              last_err = None
+              val_try = 0
+              for attempt in range(1, MAX_RETRIES + 1):
+                  throttle()   # রিট্রাইও লিমিটের মধ্যে গোনা হয়
+                  try:
+                      r = requests.post(GEMINI_URL, json=body, stream=True, timeout=(30, 300))
+                      if r.status_code != 200:
+                          txt = r.text
+                          last_err = f"HTTP {r.status_code}: {txt[:300]}"
+                          if r.status_code == 429:
+                              low = txt.lower()
+                              if "perday" in low or "per day" in low or "daily" in low:
+                                  raise DailyLimit("Gemini দৈনিক কোটা শেষ (429 PerDay)")
+                              delay = parse_retry_delay(txt)
+                              wait = max(65.0, (delay or 0) + 5)
+                              log(f"   ⚠ 429 (মিনিট/টোকেন সীমা) — {wait:.0f}s অপেক্ষা")
+                              time.sleep(wait)
+                              continue
+                          if r.status_code in (401, 403) or (
+                                  r.status_code == 400 and "api key" in txt.lower()):
+                              raise FatalError(f"API key/অনুমতি সমস্যা — {last_err[:400]}")
+                          if r.status_code in (500, 502, 503, 504):
+                              wait = min(120, 10 * attempt * attempt)
+                              log(f"   ↻ চেষ্টা {attempt}/{MAX_RETRIES} — {last_err[:150]} — {wait}s অপেক্ষা")
+                              time.sleep(wait)
+                              continue
+                          raise RuntimeError(last_err)
+
+                      r.encoding = "utf-8"  # SSE তে charset না থাকলে requests ISO-8859-1 ধরে, তাই UTF-8 জোর করে দেওয়া হলো
+                      chunks, finish, tokens = [], None, None
+                      for raw in r.iter_lines(decode_unicode=True):
+                          if not raw or not raw.startswith("data:"):
+                              continue
+                          data = raw[5:].strip()
+                          if not data or data == "[DONE]":
+                              continue
+                          try:
+                              j = json.loads(data)
+                          except json.JSONDecodeError:
+                              continue
+                          for cand in j.get("candidates", []):
+                              for p in cand.get("content", {}).get("parts", []):
+                                  if "text" in p:
+                                      chunks.append(p["text"])
+                              if cand.get("finishReason"):
+                                  finish = cand["finishReason"]
+                          um = j.get("usageMetadata")
+                          if um and um.get("totalTokenCount"):
+                              tokens = um["totalTokenCount"]
+                          if j.get("promptFeedback", {}).get("blockReason"):
+                              raise RuntimeError("Blocked: " + j["promptFeedback"]["blockReason"])
+
+                      if tokens:
+                          tok_events.append((time.time(), tokens))
+                          state["last_tokens"] = int(tokens * 1.2)
+
+                      text = "".join(chunks).strip()
+                      if not text:
+                          last_err = f"খালি রেসপন্স (finishReason={finish})"
+                          log(f"   ↻ চেষ্টা {attempt}/{MAX_RETRIES} — {last_err}")
+                          time.sleep(5 * attempt)
+                          continue
+                      problems = validate(text)
+                      if problems and val_try < VAL_RETRIES:
+                          val_try += 1
+                          log(f"   ⚠ যাচাইয়ে সমস্যা ({val_try}/{VAL_RETRIES}) — আবার চেষ্টা: " + " | ".join(problems[:3]))
+                          time.sleep(3)
+                          continue
+                      return text, finish, problems
+                  except (DailyLimit, FatalError):
+                      raise
+                  except (requests.RequestException, RuntimeError) as e:
+                      last_err = str(e)
+                      log(f"   ↻ চেষ্টা {attempt}/{MAX_RETRIES} — {last_err[:300]}")
+                      time.sleep(min(60, 5 * attempt))
+              raise RuntimeError(last_err or "unknown error")
+
+          # ---------- কমিট ও পুশ ----------
+          sh("git", "config", "user.name", "github-actions[bot]")
+          sh("git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+
+          def commit_push(files, msg):
+              sh("git", "add", *files)
+              if sh("git", "diff", "--cached", "--quiet", check=False).returncode == 0:
+                  return
+              sh("git", "commit", "-m", msg)
+              for i in range(1, 6):
+                  sh("git", "pull", "--rebase", "--autostash", check=False)
+                  res = sh("git", "push", check=False)
+                  if res.returncode == 0:
+                      return
+                  log(f"   push ব্যর্থ ({i}/5): {res.stderr.strip()[:200]}")
+                  time.sleep(3 * i)
+              raise RuntimeError("git push ব্যর্থ হয়েছে")
+
+          # ---------- মূল লুপ ----------
+          done_set = set(completed)
+
+          # পেইজ নম্বর = ফাইলের নামের শেষ সংখ্যা (0008.jpg → 8); সংখ্যা না থাকলে তালিকার ক্রম (১ থেকে)
+          def page_no(name, pos):
+              nums = re.findall(r"\d+", os.path.splitext(name)[0])
+              return int(nums[-1]) if nums else pos + 1
+
+          page_nums = {n: page_no(n, p) for p, n in enumerate(images)}
+          before_start = [i for i in images if page_nums[i] < START_PAGE]
+          pending = [i for i in images if i not in done_set and page_nums[i] >= START_PAGE]
+          log(f"মোট: {total} | সম্পূর্ণ: {len(done_set)} | শুরুর পেইজ: {START_PAGE} "
+              f"(এর আগের {len(before_start)}টি বাদ) | বাকি: {len(pending)}")
+          if not pending:
+              log(f"শুরুর পেইজ {START_PAGE} থেকে প্রসেস করার মতো কোনো ইমেজ বাকি নেই।")
+          log(f"লিমিট সেটিং: RPM={RPM}, গ্যাপ≥{MIN_GAP:.0f}s, RPD={RPD_LIMIT} (আজ আগে ব্যবহার: {usage['requests']}), TPM<{TPM_SAFE}")
+
+          processed = 0
+          stopped_for_time = False
+          stopped_daily = False
+          stopped_fatal = False
+          for name in pending:
+              if MAX_IMAGES and processed >= MAX_IMAGES:
+                  break
+              if time.time() - START > TIME_BUDGET:
+                  stopped_for_time = True
+                  log("⏱ সময়সীমা প্রায় শেষ — এই রান এখানেই থামছে।")
+                  break
+
+              idx = images.index(name) + 1
+              log(f"[{idx}/{total}] {name} → প্রসেসিং... (আজকের রিকুয়েস্ট: {usage['requests']}/{RPD_LIMIT})")
+              out_name = os.path.splitext(name)[0] + ".txt"
+              out_path = os.path.join(OUTPUT_DIR, out_name)
+              try:
+                  text, finish, problems = ocr_image(os.path.join(PAGES_DIR, name))
+                  if problems:
+                      warnings[name] = problems
+                      log("   ⚠ সতর্কতা (হাতে দেখে নিন): " + " | ".join(problems))
+                  else:
+                      warnings.pop(name, None)
+                  with open(out_path, "w", encoding="utf-8") as f:
+                      f.write(text + "\n")
+                  if name not in completed:
+                      completed.append(name)
+                  failed.pop(name, None)
+                  save_progress(last=name)
+                  commit_push([out_path, PROGRESS_FILE],
+                              f"OCR: {name} ({len(completed)}/{total})")
+                  log(f"   ✔ সম্পন্ন ও পুশ হয়েছে ({len(text)} অক্ষর, finish={finish})")
+                  processed += 1
+              except DailyLimit as e:
+                  stopped_daily = True
+                  log(f"🛑 {e}")
+                  log(f"   দৈনিক কোটা রিসেট: {reset_time_bd()} — এরপর আবার রান দিন।")
+                  save_progress()
+                  try:
+                      commit_push([PROGRESS_FILE], "OCR: daily limit reached")
+                  except Exception as ee:
+                      log(f"   progress পুশ ব্যর্থ: {ee}")
+                  break
+              except FatalError as e:
+                  stopped_fatal = True
+                  log(f"::error::🛑 {e}")
+                  log("   নতুন API key বানিয়ে GitHub secret আপডেট করে আবার রান দিন। অগ্রগতি সংরক্ষিত আছে।")
+                  save_progress()
+                  try:
+                      commit_push([PROGRESS_FILE], "OCR: stopped (API key error)")
+                  except Exception as ee:
+                      log(f"   progress পুশ ব্যর্থ: {ee}")
+                  break
+              except Exception as e:
+                  log(f"   ✘ ব্যর্থ: {name} — {e}")
+                  failed[name] = {"error": str(e)[:300],
+                                  "at": datetime.now(timezone.utc).isoformat()}
+                  save_progress()
+                  try:
+                      commit_push([PROGRESS_FILE], f"OCR failed: {name}")
+                  except Exception as ee:
+                      log(f"   progress পুশ ব্যর্থ: {ee}")
+                  processed += 1
+
+          # ---------- শেষ ----------
+          done_set = set(completed)
+          remaining = [i for i in images if i not in done_set and page_nums[i] >= START_PAGE]
+          retriable = [i for i in remaining if i not in failed]
+          log(f"\nএই রানে প্রসেস: {processed} | মোট সম্পূর্ণ: {len(done_set)}/{total} | ব্যর্থ: {len(failed)} | আজকের রিকুয়েস্ট: {usage['requests']}/{RPD_LIMIT}")
+
+          # শুধু সময় শেষ হলে নিজেকে আবার চালু করবে; দৈনিক লিমিটে থামলে করবে না
+          again = bool(stopped_for_time and retriable and not stopped_daily and not stopped_fatal)
+          set_output("remaining", "true" if again else "false")
+          if failed:
+              log("ব্যর্থ ফাইল: " + ", ".join(failed.keys()))
+          if warnings:
+              log("⚠ যাচাইয়ে সন্দেহজনক (ocr_progress.json → warnings দেখুন): " + ", ".join(warnings.keys()))
+          if stopped_fatal:
+              sys.exit(1)   # রান লাল (failed) দেখাবে, যাতে সমস্যা চোখে পড়ে
+          PY
+
+      - name: Re-trigger if work remains
+        if: steps.ocr.outputs.remaining == 'true'
+        # নিজেকে আবার চালু করার সময় একই ইনপুটগুলো পাঠায় (না হলে ডিফল্ট মানে চলে যেত)
+        run: |
+          gh workflow run "${{ github.workflow }}" --ref "${{ github.ref_name }}" \
+            -f pages_dir="${PAGES_DIR}" \
+            -f output_dir="${OUTPUT_DIR}" \
+            -f prompt_file="${PROMPT_FILE}" \
+            -f model="${MODEL}" \
+            -f rpm="${RPM}" \
+            -f rpd_limit="${RPD_LIMIT}" \
+            -f start_page="${START_PAGE}" \
+            -f max_images="${MAX_IMAGES}"
