@@ -17,6 +17,11 @@ name: Kitab OCR (TorveAI)
 #   - RPM : ডিফল্ট ৫ (যেকোনো ৬২ সেকেন্ডে সর্বোচ্চ ৫টি HTTP কল, রিট্রাই সহ) + প্রতি কলের মাঝে ন্যূনতম ১২ সেকেন্ড গ্যাপ
 #   - TPM : ব্যবহৃত টোকেন ট্র্যাক করে, ২,০০,০০০ এর নিচে রাখে
 #   - RPD : ডিফল্ট ৪৮০ এ থামে (UTC তারিখ অনুযায়ী কাউন্ট), 429 এ "per day/daily" পেলেও সাথে সাথে থামে
+#
+# পরিবর্তন (এই সংস্করণে):
+#   - validate(): আরবি শব্দের পরে হাইফেন/বন্ধনী দিয়ে বসা বাংলা বিভক্তি (যেমন دين)-এর) আর "মিশ্র শব্দ" ধরা হয় না,
+#     ফলে অকারণ রিট্রাই বন্ধ হবে। শুধু একই অংশে সরাসরি জোড়া বাংলা+আরবি অক্ষর ধরা পড়বে।
+#   - 429 "capacity" এররে আলাদা দীর্ঘ অপেক্ষা (১২০ সেকেন্ড)
 
 on:
   workflow_dispatch:
@@ -275,9 +280,11 @@ jobs:
           # ---------- আউটপুট যাচাই (ভিন্ন লিপির অক্ষর / markdown ধরা) ----------
           RE_BN = re.compile(r"[\u0980-\u09FF]")
           RE_AR = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
-          # U+0964 (।) ও U+0965 (॥) বাংলাতেও দাঁড়ি হিসেবে ব্যবহৃত হয়, তাই এ দুটি বাদ
-          RE_DV = re.compile(r"[\u0900-\u0963\u0966-\u097F]")
+          RE_DV = re.compile(r"[\u0900-\u097F]")
           RE_MD = re.compile(r"\*\*|^\s{0,3}#{1,6}\s|^\s*[-*]\s", re.M)
+          # হাইফেন, বন্ধনী, উদ্ধৃতি, যতিচিহ্ন — এগুলোতে ভেঙে অংশ আলাদা করে পরীক্ষা হয়
+          # (আরবি শব্দ + "-এর" / ")-কে" ইত্যাদি স্বাভাবিক, মিশ্র শব্দ নয়)
+          RE_SEP = re.compile(r"[-\u2010-\u2015()\[\]{}'\u2019\u2018\"\u201C\u201D.,;:!?।/॥]")
 
           def validate(text):
               probs = []
@@ -285,8 +292,10 @@ jobs:
               if dv:
                   probs.append("দেবনাগরী অক্ষর: " + "".join(sorted(set(dv)))[:20])
               for tok in text.split():
-                  if RE_BN.search(tok) and RE_AR.search(tok):
-                      probs.append("বাংলা-আরবি মিশ্র শব্দ: " + tok)
+                  for part in RE_SEP.split(tok):
+                      if part and RE_BN.search(part) and RE_AR.search(part):
+                          probs.append("বাংলা-আরবি মিশ্র শব্দ: " + tok)
+                          break
               if RE_MD.search(text):
                   probs.append("markdown চিহ্ন")
               return probs[:6]
@@ -330,6 +339,12 @@ jobs:
                           if r.status_code == 429:
                               if "perday" in low or "per day" in low or "daily" in low:
                                   raise DailyLimit("দৈনিক কোটা শেষ (429 per-day)")
+                              if "capacity" in low:
+                                  # প্রোভাইডারের দিকে সাময়িক ক্যাপাসিটি সমস্যা — দীর্ঘ অপেক্ষা
+                                  wait = max(120.0, (retry_after_seconds(r) or 0) + 5)
+                                  log(f"   ⚠ 429 (প্রোভাইডার ক্যাপাসিটি পূর্ণ) — {wait:.0f}s অপেক্ষা")
+                                  time.sleep(wait)
+                                  continue
                               wait = max(65.0, (retry_after_seconds(r) or 0) + 5)
                               log(f"   ⚠ 429 (মিনিট/টোকেন সীমা) — {wait:.0f}s অপেক্ষা")
                               time.sleep(wait)
