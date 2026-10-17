@@ -7,7 +7,7 @@
   "next_pending": "0014.jpg",
   "usage": {
     "date": "2026-10-17",
-    "requests": 19
+    "requests": 25
   },
   "completed": [
     "0001.jpg",
@@ -24,7 +24,12 @@
     "0012.jpg",
     "0013.jpg"
   ],
-  "failed": {},
+  "failed": {
+    "0014.jpg": {
+      "error": "HTTP 429: {\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Every provider and credential for this model is at capacity.\",\"type\":\"rate_limit_exceeded\"}}\n",
+      "at": "2026-10-17T20:03:29.525125+00:00"
+    }
+  },
   "warnings": {
     "0012.jpg": [
       "বাংলা-আরবি মিশ্র শব্দ: دين)-এর"
@@ -34,5 +39,5 @@
       "বাংলা-আরবি মিশ্র শব্দ: وَسَلَّمَ)-এর"
     ]
   },
-  "updated_at": "2026-10-17T19:55:29.031528+00:00"
+  "updated_at": "2026-10-17T20:03:29.525171+00:00"
 }
