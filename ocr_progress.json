@@ -1,0 +1,16 @@
+{
+  "provider": "torveai",
+  "model": "claude-opus-5-5",
+  "total_images": 20,
+  "completed_count": 0,
+  "last_completed": null,
+  "next_pending": "0001.jpg",
+  "usage": {
+    "date": "2026-10-17",
+    "requests": 1
+  },
+  "completed": [],
+  "failed": {},
+  "warnings": {},
+  "updated_at": "2026-10-17T18:25:16.431012+00:00"
+}
