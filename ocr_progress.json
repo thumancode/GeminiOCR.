@@ -1,0 +1,18 @@
+{
+  "provider": "torveai",
+  "model": "claude-fable-5",
+  "total_images": 52,
+  "completed_count": 1,
+  "last_completed": "0005.jpg",
+  "next_pending": "0001.jpg",
+  "usage": {
+    "date": "2026-10-17",
+    "requests": 1
+  },
+  "completed": [
+    "0005.jpg"
+  ],
+  "failed": {},
+  "warnings": {},
+  "updated_at": "2026-10-17T20:11:53.379231+00:00"
+}
