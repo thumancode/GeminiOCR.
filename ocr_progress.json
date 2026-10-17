@@ -1,18 +1,19 @@
 {
   "model": "qwen/qwen3.8-27b",
   "total_images": 20,
-  "completed_count": 3,
-  "last_completed": "0003.jpg",
-  "next_pending": "0004.jpg",
+  "completed_count": 4,
+  "last_completed": "0004.jpg",
+  "next_pending": "0005.jpg",
   "usage": {
     "date": "2026-10-17",
-    "requests": 9,
-    "tokens": 41287
+    "requests": 13,
+    "tokens": 59715
   },
   "completed": [
     "0001.jpg",
     "0002.jpg",
-    "0003.jpg"
+    "0003.jpg",
+    "0004.jpg"
   ],
   "failed": {},
   "warnings": {
@@ -23,7 +24,10 @@
     "0003.jpg": [
       "দেবনাগরী অক্ষর: ।",
       "বাংলা-আরবি মিশ্র শব্দ: عَلَيْهِ'র"
+    ],
+    "0004.jpg": [
+      "দেবনাগরী অক্ষর: ।"
     ]
   },
-  "updated_at": "2026-10-17T13:55:29.806149+00:00"
+  "updated_at": "2026-10-17T13:59:47.170366+00:00"
 }
