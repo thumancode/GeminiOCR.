@@ -1,0 +1,13 @@
+name: List TorveAI models
+on: workflow_dispatch
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch models
+        env:
+          TORVEAI_API_KEY: ${{ secrets.TORVEAI_API_KEY }}
+        run: |
+          curl -s https://api.torveai.com/v1/models \
+            -H "Authorization: Bearer $TORVEAI_API_KEY" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); [print(m.get('id')) for m in d.get('data',[])] if 'data' in d else print(d)"
