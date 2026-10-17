@@ -2,19 +2,20 @@
   "provider": "torveai",
   "model": "claude-fable-5",
   "total_images": 52,
-  "completed_count": 5,
-  "last_completed": "0009.jpg",
+  "completed_count": 6,
+  "last_completed": "0010.jpg",
   "next_pending": "0001.jpg",
   "usage": {
     "date": "2026-10-17",
-    "requests": 15
+    "requests": 19
   },
   "completed": [
     "0005.jpg",
     "0006.jpg",
     "0007.jpg",
     "0008.jpg",
-    "0009.jpg"
+    "0009.jpg",
+    "0010.jpg"
   ],
   "failed": {},
   "warnings": {
@@ -26,7 +27,11 @@
     ],
     "0009.jpg": [
       "দেবনাগরী অক্ষর: ।"
+    ],
+    "0010.jpg": [
+      "দেবনাগরী অক্ষর: ।",
+      "বাংলা-আরবি মিশ্র শব্দ: নঈমী،"
     ]
   },
-  "updated_at": "2026-10-17T20:26:37.883120+00:00"
+  "updated_at": "2026-10-17T20:30:58.530490+00:00"
 }
