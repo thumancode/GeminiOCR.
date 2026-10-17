@@ -2,23 +2,27 @@
   "provider": "torveai",
   "model": "claude-fable-5",
   "total_images": 52,
-  "completed_count": 3,
-  "last_completed": "0007.jpg",
+  "completed_count": 4,
+  "last_completed": "0008.jpg",
   "next_pending": "0001.jpg",
   "usage": {
     "date": "2026-10-17",
-    "requests": 7
+    "requests": 11
   },
   "completed": [
     "0005.jpg",
     "0006.jpg",
-    "0007.jpg"
+    "0007.jpg",
+    "0008.jpg"
   ],
   "failed": {},
   "warnings": {
     "0007.jpg": [
       "দেবনাগরী অক্ষর: ।"
+    ],
+    "0008.jpg": [
+      "দেবনাগরী অক্ষর: ।"
     ]
   },
-  "updated_at": "2026-10-17T20:18:10.913079+00:00"
+  "updated_at": "2026-10-17T20:22:15.822358+00:00"
 }
