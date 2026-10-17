@@ -1,0 +1,565 @@
+name: Kitab OCR (Groq)
+
+# ব্যবহার: এই ফাইলটি রাখুন  .github/workflows/kitab-ocr-groq.yml
+# Secret: Settings → Secrets and variables → Actions → New repository secret → নাম: GROQ_API_KEY
+# Settings → Actions → General → Workflow permissions → Read and write permissions
+#
+# রিপোর গঠন:
+#   prompt.txt          (মেইন রিপোতে, প্রম্পট)
+#   pages/              (কিতাবের ইমেজ: 0001.jpg, 0002.jpg ...)
+#   texts/              (আউটপুট txt এখানে তৈরি হবে)
+#   ocr_progress.json   (অগ্রগতি + দৈনিক রিকুয়েস্ট কাউন্ট)
+#
+# গুরুত্বপূর্ণ: OCR এর জন্য ইমেজ-ইনপুট সাপোর্ট করে এমন (vision) মডেল লাগবে।
+#   openai/gpt-oss-20b শুধু টেক্সট মডেল — ইমেজ পড়তে পারে না, তাই এখানে ব্যবহার করা যাবে না।
+#   Groq এর বর্তমান vision মডেল: https://console.groq.com/docs/vision
+#
+# লিমিট সুরক্ষা (মডেল ভেদে কোটা আলাদা — https://console.groq.com/settings/limits এ নিজের কোটা দেখে
+# rpm / rpd_limit / tpm ঠিক করুন; নিচের ডিফল্ট মান বেশ রক্ষণশীল):
+#   - RPM : স্লাইডিং ৬২ সেকেন্ড উইন্ডোতে সর্বোচ্চ RPM টি HTTP কল (রিট্রাই সহ) + কলের মাঝে ন্যূনতম 60/RPM সেকেন্ড গ্যাপ
+#   - TPM : ব্যবহৃত টোকেন ট্র্যাক করে, TPM সীমার নিচে রাখে
+#   - TPD : দৈনিক ব্যবহৃত টোকেন গোনে, সীমার কাছে গেলে থামে (qwen3.8-27b ফ্রি প্ল্যানে ২ লাখ — এটাই আসল বাধা)
+#   - RPD : সীমায় পৌঁছালে থামে (UTC তারিখ অনুযায়ী কাউন্ট); Groq 429 এ "per day" লিখলেও সাথে সাথে থামে
+
+on:
+  workflow_dispatch:
+    inputs:
+      pages_dir:
+        description: "ইমেজ ফোল্ডার"
+        default: "pages"
+      output_dir:
+        description: "টেক্সট আউটপুট ফোল্ডার"
+        default: "texts"
+      prompt_file:
+        description: "প্রম্পট ফাইল"
+        default: "prompt.txt"
+      model:
+        description: "Groq vision মডেল (ইমেজ সাপোর্ট থাকতে হবে)"
+        default: "qwen/qwen3.8-27b"
+      rpm:
+        description: "প্রতি মিনিটে সর্বোচ্চ রিকুয়েস্ট (নিজের কোটা অনুযায়ী)"
+        default: "10"
+      tpm:
+        description: "প্রতি মিনিটে সর্বোচ্চ টোকেন (কোটা 8000 হলে 7500)"
+        default: "7500"
+      tpd:
+        description: "দৈনিক সর্বোচ্চ টোকেন (কোটা 200000 হলে 190000)"
+        default: "190000"
+      rpd_limit:
+        description: "দৈনিক সর্বোচ্চ রিকুয়েস্ট (কোটা 1000 হলে 950)"
+        default: "950"
+      max_out:
+        description: "এক পেইজের সর্বোচ্চ আউটপুট টোকেন (TPM কম বলে বেশি দেবেন না)"
+        default: "3500"
+      start_page:
+        description: "কত নম্বর পেইজ থেকে শুরু হবে (ফাইলের নামের সংখ্যা ধরে, যেমন 0008.jpg = 8; 1 = শুরু থেকে)"
+        default: "1"
+      max_images:
+        description: "এই রানে সর্বোচ্চ কয়টি ইমেজ (0 = সব)"
+        default: "0"
+
+permissions:
+  contents: write   # টেক্সট ও json পুশ করার জন্য
+  actions: write    # সময় শেষ হলে নিজেকে আবার চালু করার জন্য
+
+# একসাথে দুইটা রান যেন না চলে (না হলে লিমিট দ্বিগুণ খরচ হবে)
+concurrency:
+  group: kitab-ocr
+  cancel-in-progress: false
+
+jobs:
+  ocr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      PAGES_DIR: ${{ inputs.pages_dir || 'pages' }}
+      OUTPUT_DIR: ${{ inputs.output_dir || 'texts' }}
+      PROMPT_FILE: ${{ inputs.prompt_file || 'prompt.txt' }}
+      MODEL: ${{ inputs.model || 'qwen/qwen3.8-27b' }}
+      RPM: ${{ inputs.rpm || '10' }}
+      TPM: ${{ inputs.tpm || '7500' }}
+      TPD: ${{ inputs.tpd || '190000' }}
+      RPD_LIMIT: ${{ inputs.rpd_limit || '950' }}
+      MAX_OUT: ${{ inputs.max_out || '3500' }}
+      START_PAGE: ${{ inputs.start_page || '1' }}
+      MAX_IMAGES: ${{ inputs.max_images || '0' }}
+      PROGRESS_FILE: ocr_progress.json
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests pillow
+
+      - name: Run OCR (one image at a time, push after each)
+        id: ocr
+        run: |
+          python3 - <<'PY'
+          import os, re, io, sys, json, time, base64, subprocess
+          from collections import deque
+          from datetime import datetime, timezone, timedelta
+          from zoneinfo import ZoneInfo
+          import requests
+
+          # ---------- কনফিগ ----------
+          API_KEY       = os.environ.get("GROQ_API_KEY", "").strip()
+          PAGES_DIR     = os.environ["PAGES_DIR"]
+          OUTPUT_DIR    = os.environ["OUTPUT_DIR"]
+          PROMPT_FILE   = os.environ["PROMPT_FILE"]
+          MODEL         = os.environ["MODEL"]
+          MAX_IMAGES    = int(os.environ.get("MAX_IMAGES", "0") or 0)
+          START_PAGE    = max(1, int(os.environ.get("START_PAGE", "1") or 1))
+          PROGRESS_FILE = os.environ["PROGRESS_FILE"]
+
+          RPM           = max(1, int(os.environ.get("RPM", "10") or 10))
+          RPD_LIMIT     = max(1, int(os.environ.get("RPD_LIMIT", "950") or 950))
+          TPM_SAFE      = max(1000, int(os.environ.get("TPM", "7500") or 7500))
+          TPD_LIMIT     = max(1000, int(os.environ.get("TPD", "190000") or 190000))
+          WINDOW        = 62.0             # ৬০ সেকেন্ডের বদলে ২ সেকেন্ড বেশি, নিরাপত্তার জন্য
+          MIN_GAP       = 60.0 / RPM       # দুই কলের মাঝে ন্যূনতম বিরতি
+
+          MAX_OUT       = max(500, int(os.environ.get("MAX_OUT", "3500") or 3500))  # এক পেইজের সর্বোচ্চ আউটপুট টোকেন
+          RAW_LIMIT     = 2_700_000        # base64 হলে ~3.6MB; Groq এর base64 সীমা 4MB
+          MAX_PIXELS    = 30_000_000       # Groq এর সীমা ~33 মেগাপিক্সেল
+
+          MAX_RETRIES   = 6
+          VAL_RETRIES   = 3                # ভিন্ন লিপির অক্ষর ধরা পড়লে সর্বোচ্চ কতবার আবার চেষ্টা
+          TIME_BUDGET   = 5 * 3600 + 35 * 60
+          START         = time.time()
+          BD            = ZoneInfo("Asia/Dhaka")
+          EXTS          = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                           ".png": "image/png", ".webp": "image/webp"}
+
+          GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+          HEADERS  = {"Authorization": f"Bearer {API_KEY}",
+                      "Content-Type": "application/json"}
+
+          class DailyLimit(Exception):
+              pass
+
+          class FatalError(Exception):
+              """API key / অনুমতি / মডেলের সমস্যা — retry করে লাভ নেই, পুরো রান থামাতে হবে।"""
+              pass
+
+          def log(*a):
+              print(*a, flush=True)
+
+          def set_output(k, v):
+              path = os.environ.get("GITHUB_OUTPUT")
+              if path:
+                  with open(path, "a") as f:
+                      f.write(f"{k}={v}\n")
+
+          def sh(*cmd, check=True):
+              return subprocess.run(cmd, check=check, capture_output=True, text=True)
+
+          def natural_key(s):
+              return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+          def day_key():
+              return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+          def reset_time_bd():
+              n = datetime.now(timezone.utc)
+              nxt = (n + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+              return nxt.astimezone(BD).strftime("%Y-%m-%d %I:%M %p (বাংলাদেশ সময়)")
+
+          # ---------- প্রি-চেক ----------
+          if not API_KEY:
+              log("::error::GROQ_API_KEY secret সেট করা নেই।")
+              sys.exit(1)
+          if not os.path.isfile(PROMPT_FILE):
+              log(f"::error::{PROMPT_FILE} পাওয়া যায়নি।")
+              sys.exit(1)
+          if not os.path.isdir(PAGES_DIR):
+              log(f"::error::{PAGES_DIR}/ ফোল্ডার পাওয়া যায়নি।")
+              sys.exit(1)
+
+          with open(PROMPT_FILE, encoding="utf-8") as f:
+              PROMPT = f.read().strip()
+          if not PROMPT:
+              log("::error::prompt.txt খালি।")
+              sys.exit(1)
+
+          os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+          images = sorted(
+              [f for f in os.listdir(PAGES_DIR)
+               if os.path.splitext(f)[1].lower() in EXTS],
+              key=natural_key)
+          total = len(images)
+          if total == 0:
+              log("কোনো ইমেজ পাওয়া যায়নি।")
+              set_output("remaining", "false")
+              sys.exit(0)
+
+          # ---------- প্রগ্রেস লোড ----------
+          def load_progress():
+              if os.path.isfile(PROGRESS_FILE):
+                  try:
+                      with open(PROGRESS_FILE, encoding="utf-8") as f:
+                          return json.load(f)
+                  except Exception:
+                      pass
+              return {}
+
+          progress = load_progress()
+          completed = list(progress.get("completed", []))
+          failed = dict(progress.get("failed", {}))
+          warnings = dict(progress.get("warnings", {}))
+          last_completed = progress.get("last_completed")
+          usage = progress.get("usage", {})
+          if usage.get("date") != day_key():
+              usage = {"date": day_key(), "requests": 0, "tokens": 0}
+          usage.setdefault("tokens", 0)
+
+          def save_progress(last=None):
+              global last_completed
+              if last:
+                  last_completed = last
+              done_set = set(completed)
+              obj = {
+                  "model": MODEL,
+                  "total_images": total,
+                  "completed_count": len(completed),
+                  "last_completed": last_completed,
+                  "next_pending": next((i for i in images if i not in done_set), None),
+                  "usage": usage,
+                  "completed": completed,
+                  "failed": failed,
+                  "warnings": warnings,
+                  "updated_at": datetime.now(timezone.utc).isoformat(),
+              }
+              with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+                  json.dump(obj, f, ensure_ascii=False, indent=2)
+
+          # ---------- রেট-লিমিট নিয়ন্ত্রণ ----------
+          req_times = deque()      # প্রতিটি HTTP কলের সময় (রিট্রাই সহ)
+          tok_events = deque()     # (সময়, টোকেন)
+          state = {"last_req": 0.0, "last_tokens": 4000}
+
+          def throttle():
+              """কল করার আগে RPM / TPM / RPD তিনটাই নিশ্চিত করে।"""
+              global usage
+              if usage.get("date") != day_key():
+                  usage = {"date": day_key(), "requests": 0, "tokens": 0}
+              usage.setdefault("tokens", 0)
+              if usage["requests"] >= RPD_LIMIT:
+                  raise DailyLimit(f"দৈনিক রিকুয়েস্ট সীমা ({RPD_LIMIT}) পূর্ণ")
+              if usage["tokens"] + state["last_tokens"] > TPD_LIMIT:
+                  raise DailyLimit(f"দৈনিক টোকেন সীমা ({TPD_LIMIT}) প্রায় পূর্ণ (ব্যবহৃত: {usage['tokens']})")
+              while True:
+                  now = time.time()
+                  while req_times and now - req_times[0] >= WINDOW:
+                      req_times.popleft()
+                  while tok_events and now - tok_events[0][0] >= WINDOW:
+                      tok_events.popleft()
+                  wait = 0.0
+                  # ন্যূনতম গ্যাপ
+                  wait = max(wait, MIN_GAP - (now - state["last_req"]))
+                  # স্লাইডিং উইন্ডো RPM
+                  if len(req_times) >= RPM:
+                      wait = max(wait, WINDOW - (now - req_times[0]))
+                  # TPM
+                  used = sum(t for _, t in tok_events)
+                  if tok_events and used + state["last_tokens"] > TPM_SAFE:
+                      wait = max(wait, WINDOW - (now - tok_events[0][0]))
+                  if wait <= 0:
+                      break
+                  log(f"   ⏳ লিমিট সুরক্ষা: {wait:.0f}s অপেক্ষা (RPM={len(req_times)}/{RPM}, TPM≈{used})")
+                  time.sleep(wait + 0.3)
+              t = time.time()
+              req_times.append(t)
+              state["last_req"] = t
+              usage["requests"] += 1
+
+          def retry_after(headers, body):
+              """Groq এর retry-after হেডার বা মেসেজের 'try again in 7.5s / 2m59s / 340ms' থেকে সেকেন্ড বের করে।"""
+              ra = headers.get("retry-after")
+              if ra:
+                  try:
+                      return float(ra)
+                  except ValueError:
+                      pass
+              m = re.search(r"try again in\s+((?:[\d.]+(?:ms|h|m|s)\s*)+)", body, re.I)
+              if not m:
+                  return None
+              total_s = 0.0
+              for num, unit in re.findall(r"([\d.]+)(ms|h|m|s)", m.group(1)):
+                  v = float(num)
+                  total_s += v * {"h": 3600, "m": 60, "s": 1, "ms": 0.001}[unit]
+              return total_s
+
+          # ---------- আউটপুট যাচাই (ভিন্ন লিপির অক্ষর / markdown ধরা) ----------
+          RE_BN = re.compile(r"[\u0980-\u09FF]")
+          RE_AR = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
+          RE_DV = re.compile(r"[\u0900-\u097F]")
+          RE_MD = re.compile(r"\*\*|^\s{0,3}#{1,6}\s|^\s*[-*]\s", re.M)
+          RE_THINK = re.compile(r"<think>.*?(?:</think>|$)", re.S | re.I)
+
+          def validate(text):
+              probs = []
+              dv = RE_DV.findall(text)
+              if dv:
+                  probs.append("দেবনাগরী অক্ষর: " + "".join(sorted(set(dv)))[:20])
+              for tok in text.split():
+                  if RE_BN.search(tok) and RE_AR.search(tok):
+                      probs.append("বাংলা-আরবি মিশ্র শব্দ: " + tok)
+              if RE_MD.search(text):
+                  probs.append("markdown চিহ্ন")
+              return probs[:6]
+
+          # ---------- ইমেজ প্রস্তুত (বড় হলে ছোট করে, Groq এর সীমার ভেতরে রাখে) ----------
+          def prepare_image(path):
+              mime = EXTS[os.path.splitext(path)[1].lower()]
+              with open(path, "rb") as f:
+                  raw = f.read()
+              im, pixels = None, 0
+              try:
+                  from PIL import Image
+                  im = Image.open(io.BytesIO(raw))
+                  pixels = im.size[0] * im.size[1]
+              except Exception:
+                  im = None
+              if len(raw) <= RAW_LIMIT and pixels <= MAX_PIXELS:
+                  return mime, base64.b64encode(raw).decode()
+              if im is None:
+                  raise RuntimeError("ইমেজ খুব বড়, অথচ Pillow দিয়ে ছোট করা যায়নি")
+              im = im.convert("RGB")
+              data = b""
+              for side in (3200, 2600, 2000, 1600, 1200):
+                  t = im.copy()
+                  t.thumbnail((side, side))
+                  buf = io.BytesIO()
+                  t.save(buf, "JPEG", quality=90)
+                  data = buf.getvalue()
+                  if len(data) <= RAW_LIMIT:
+                      break
+              log(f"   ℹ ইমেজ ছোট করা হয়েছে: {len(raw)//1024}KB → {len(data)//1024}KB")
+              return "image/jpeg", base64.b64encode(data).decode()
+
+          # ---------- Groq কল (OpenAI-সামঞ্জস্যপূর্ণ chat.completions) ----------
+          def ocr_image(path):
+              mime, b64 = prepare_image(path)
+              body = {
+                  "model": MODEL,
+                  "messages": [{
+                      "role": "user",
+                      "content": [
+                          {"type": "text", "text": PROMPT},
+                          {"type": "image_url",
+                           "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                      ],
+                  }],
+                  "temperature": 0,
+                  "max_completion_tokens": MAX_OUT,
+              }
+              last_err = None
+              val_try = 0
+              for attempt in range(1, MAX_RETRIES + 1):
+                  throttle()   # রিট্রাইও লিমিটের মধ্যে গোনা হয়
+                  try:
+                      r = requests.post(GROQ_URL, headers=HEADERS, json=body, timeout=(30, 300))
+                      if r.status_code != 200:
+                          txt = r.text
+                          low = txt.lower()
+                          last_err = f"HTTP {r.status_code}: {txt[:300]}"
+                          if r.status_code == 429:
+                              if "per day" in low or "(tpd)" in low or "(rpd)" in low:
+                                  raise DailyLimit("Groq দৈনিক কোটা শেষ (429 per day)")
+                              delay = retry_after(r.headers, txt)
+                              wait = min(300.0, max(5.0, (delay if delay is not None else 30.0) + 2))
+                              log(f"   ⚠ 429 (মিনিট/টোকেন সীমা) — {wait:.0f}s অপেক্ষা")
+                              time.sleep(wait)
+                              continue
+                          if r.status_code in (401, 403):
+                              raise FatalError(f"API key/অনুমতি সমস্যা — {last_err[:400]}")
+                          if r.status_code in (400, 404) and any(k in low for k in (
+                                  "model_not_found", "does not exist", "does not support",
+                                  "not support image", "multimodal")):
+                              raise FatalError(
+                                  f"মডেল '{MODEL}' পাওয়া যায়নি বা ইমেজ সাপোর্ট করে না — {last_err[:400]}")
+                          if r.status_code in (500, 502, 503, 504):
+                              wait = min(120, 10 * attempt * attempt)
+                              log(f"   ↻ চেষ্টা {attempt}/{MAX_RETRIES} — {last_err[:150]} — {wait}s অপেক্ষা")
+                              time.sleep(wait)
+                              continue
+                          raise RuntimeError(last_err)
+
+                      j = r.json()
+                      choice = (j.get("choices") or [{}])[0]
+                      finish = choice.get("finish_reason")
+                      content = (choice.get("message") or {}).get("content") or ""
+                      tokens = (j.get("usage") or {}).get("total_tokens")
+                      if tokens:
+                          usage["tokens"] = usage.get("tokens", 0) + int(tokens)
+                          tok_events.append((time.time(), tokens))
+                          state["last_tokens"] = int(tokens * 1.2)
+
+                      # reasoning মডেলের <think>…</think> অংশ বাদ
+                      text = RE_THINK.sub("", content).strip()
+                      if not text:
+                          last_err = f"খালি রেসপন্স (finish_reason={finish})"
+                          log(f"   ↻ চেষ্টা {attempt}/{MAX_RETRIES} — {last_err}")
+                          time.sleep(5 * attempt)
+                          continue
+                      problems = validate(text)
+                      if finish == "length":
+                          problems.append(f"আউটপুট কেটে গেছে (max {MAX_OUT} টোকেন)")
+                      elif problems and val_try < VAL_RETRIES:
+                          val_try += 1
+                          log(f"   ⚠ যাচাইয়ে সমস্যা ({val_try}/{VAL_RETRIES}) — আবার চেষ্টা: " + " | ".join(problems[:3]))
+                          time.sleep(3)
+                          continue
+                      return text, finish, problems
+                  except (DailyLimit, FatalError):
+                      raise
+                  except (requests.RequestException, RuntimeError, ValueError, KeyError, IndexError) as e:
+                      last_err = str(e)
+                      log(f"   ↻ চেষ্টা {attempt}/{MAX_RETRIES} — {last_err[:300]}")
+                      time.sleep(min(60, 5 * attempt))
+              raise RuntimeError(last_err or "unknown error")
+
+          # ---------- কমিট ও পুশ ----------
+          sh("git", "config", "user.name", "github-actions[bot]")
+          sh("git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+
+          def commit_push(files, msg):
+              sh("git", "add", *files)
+              if sh("git", "diff", "--cached", "--quiet", check=False).returncode == 0:
+                  return
+              sh("git", "commit", "-m", msg)
+              for i in range(1, 6):
+                  sh("git", "pull", "--rebase", "--autostash", check=False)
+                  res = sh("git", "push", check=False)
+                  if res.returncode == 0:
+                      return
+                  log(f"   push ব্যর্থ ({i}/5): {res.stderr.strip()[:200]}")
+                  time.sleep(3 * i)
+              raise RuntimeError("git push ব্যর্থ হয়েছে")
+
+          # ---------- মূল লুপ ----------
+          done_set = set(completed)
+
+          # পেইজ নম্বর = ফাইলের নামের শেষ সংখ্যা (0008.jpg → 8); সংখ্যা না থাকলে তালিকার ক্রম (১ থেকে)
+          def page_no(name, pos):
+              nums = re.findall(r"\d+", os.path.splitext(name)[0])
+              return int(nums[-1]) if nums else pos + 1
+
+          page_nums = {n: page_no(n, p) for p, n in enumerate(images)}
+          before_start = [i for i in images if page_nums[i] < START_PAGE]
+          pending = [i for i in images if i not in done_set and page_nums[i] >= START_PAGE]
+          log(f"মডেল: {MODEL}")
+          log(f"মোট: {total} | সম্পূর্ণ: {len(done_set)} | শুরুর পেইজ: {START_PAGE} "
+              f"(এর আগের {len(before_start)}টি বাদ) | বাকি: {len(pending)}")
+          if not pending:
+              log(f"শুরুর পেইজ {START_PAGE} থেকে প্রসেস করার মতো কোনো ইমেজ বাকি নেই।")
+          log(f"লিমিট সেটিং: RPM={RPM}, গ্যাপ≥{MIN_GAP:.0f}s, RPD={RPD_LIMIT} (আজ আগে ব্যবহার: {usage['requests']}), TPM<{TPM_SAFE}, TPD<{TPD_LIMIT} (আজ আগে: {usage['tokens']}), max_out={MAX_OUT}")
+
+          processed = 0
+          stopped_for_time = False
+          stopped_daily = False
+          stopped_fatal = False
+          for name in pending:
+              if MAX_IMAGES and processed >= MAX_IMAGES:
+                  break
+              if time.time() - START > TIME_BUDGET:
+                  stopped_for_time = True
+                  log("⏱ সময়সীমা প্রায় শেষ — এই রান এখানেই থামছে।")
+                  break
+
+              idx = images.index(name) + 1
+              log(f"[{idx}/{total}] {name} → প্রসেসিং... (আজকের রিকুয়েস্ট: {usage['requests']}/{RPD_LIMIT}, টোকেন: {usage['tokens']}/{TPD_LIMIT})")
+              out_name = os.path.splitext(name)[0] + ".txt"
+              out_path = os.path.join(OUTPUT_DIR, out_name)
+              try:
+                  text, finish, problems = ocr_image(os.path.join(PAGES_DIR, name))
+                  if problems:
+                      warnings[name] = problems
+                      log("   ⚠ সতর্কতা (হাতে দেখে নিন): " + " | ".join(problems))
+                  else:
+                      warnings.pop(name, None)
+                  with open(out_path, "w", encoding="utf-8") as f:
+                      f.write(text + "\n")
+                  if name not in completed:
+                      completed.append(name)
+                  failed.pop(name, None)
+                  save_progress(last=name)
+                  commit_push([out_path, PROGRESS_FILE],
+                              f"OCR: {name} ({len(completed)}/{total})")
+                  log(f"   ✔ সম্পন্ন ও পুশ হয়েছে ({len(text)} অক্ষর, finish={finish})")
+                  processed += 1
+              except DailyLimit as e:
+                  stopped_daily = True
+                  log(f"🛑 {e}")
+                  log(f"   দৈনিক কোটা রিসেট (আনুমানিক): {reset_time_bd()} — এরপর আবার রান দিন।")
+                  save_progress()
+                  try:
+                      commit_push([PROGRESS_FILE], "OCR: daily limit reached")
+                  except Exception as ee:
+                      log(f"   progress পুশ ব্যর্থ: {ee}")
+                  break
+              except FatalError as e:
+                  stopped_fatal = True
+                  log(f"::error::🛑 {e}")
+                  log("   API key / মডেলের নাম ঠিক করে আবার রান দিন। অগ্রগতি সংরক্ষিত আছে।")
+                  save_progress()
+                  try:
+                      commit_push([PROGRESS_FILE], "OCR: stopped (API key/model error)")
+                  except Exception as ee:
+                      log(f"   progress পুশ ব্যর্থ: {ee}")
+                  break
+              except Exception as e:
+                  log(f"   ✘ ব্যর্থ: {name} — {e}")
+                  failed[name] = {"error": str(e)[:300],
+                                  "at": datetime.now(timezone.utc).isoformat()}
+                  save_progress()
+                  try:
+                      commit_push([PROGRESS_FILE], f"OCR failed: {name}")
+                  except Exception as ee:
+                      log(f"   progress পুশ ব্যর্থ: {ee}")
+                  processed += 1
+
+          # ---------- শেষ ----------
+          done_set = set(completed)
+          remaining = [i for i in images if i not in done_set and page_nums[i] >= START_PAGE]
+          retriable = [i for i in remaining if i not in failed]
+          log(f"\nএই রানে প্রসেস: {processed} | মোট সম্পূর্ণ: {len(done_set)}/{total} | ব্যর্থ: {len(failed)} | আজকের রিকুয়েস্ট: {usage['requests']}/{RPD_LIMIT}")
+
+          # শুধু সময় শেষ হলে নিজেকে আবার চালু করবে; দৈনিক লিমিটে থামলে করবে না
+          again = bool(stopped_for_time and retriable and not stopped_daily and not stopped_fatal)
+          set_output("remaining", "true" if again else "false")
+          if failed:
+              log("ব্যর্থ ফাইল: " + ", ".join(failed.keys()))
+          if warnings:
+              log("⚠ যাচাইয়ে সন্দেহজনক (ocr_progress.json → warnings দেখুন): " + ", ".join(warnings.keys()))
+          if stopped_fatal:
+              sys.exit(1)   # রান লাল (failed) দেখাবে, যাতে সমস্যা চোখে পড়ে
+          PY
+
+      - name: Re-trigger if work remains
+        if: steps.ocr.outputs.remaining == 'true'
+        # নিজেকে আবার চালু করার সময় একই ইনপুটগুলো পাঠায় (না হলে ডিফল্ট মানে চলে যেত)
+        run: |
+          gh workflow run "${{ github.workflow }}" --ref "${{ github.ref_name }}" \
+            -f pages_dir="${PAGES_DIR}" \
+            -f output_dir="${OUTPUT_DIR}" \
+            -f prompt_file="${PROMPT_FILE}" \
+            -f model="${MODEL}" \
+            -f rpm="${RPM}" \
+            -f tpm="${TPM}" \
+            -f tpd="${TPD}" \
+            -f max_out="${MAX_OUT}" \
+            -f rpd_limit="${RPD_LIMIT}" \
+            -f start_page="${START_PAGE}" \
+            -f max_images="${MAX_IMAGES}"
