@@ -1,4 +1,4 @@
-name: Kitab OCR (Gemini)
+name: Kitab OCR (Gemini)-2
 
 # ব্যবহার: এই ফাইলটি রাখুন  .github/workflows/kitab-ocr.yml
 # Secret: Settings → Secrets and variables → Actions → New repository secret → নাম: GEMINI_API_KEY
